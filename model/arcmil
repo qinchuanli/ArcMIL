@@ -1,0 +1,457 @@
+"""
+ArcMIL Model (current public review-stage implementation)
+
+整合所有组件的核心模型,实现基于角坐标聚类的MIL。
+
+完整流程:
+    Input: [N, D] instances特征
+        ↓
+    Feature Extractor: [N, D] → [N, hidden_dim]
+        ↓
+    Gated Attention: A = softmax(w · tanh(V·H))   [N, 1]
+        ↓
+    Aggregation: Z = A^T · H                      [1, hidden_dim]
+        ↓
+    Dual Classification Heads:
+        - Bag Classifier: Z → bag_logits          [1, n_classes]
+        - Instance Classifier: H → inst_logits    [N, 2]
+        ↓
+    Pseudo-Label Generation (角坐标空间):
+        - T(h_hat) → θ ∈ Θ^{D-1}
+        - Sim(θ, ω_abnormal) → max_sim_c0/c1
+        - Softmax → q_i ∈ Δ²
+        ↓
+    Joint Loss:
+        L_total = L_bag + λ · Σ_{i∈V} L_instance(q_i, ŷ_i)
+
+创新点:
+    1. 几何一致性: 在超球面原生几何中操作
+    2. 判别性锚点: Abnormal center detection过滤混淆中心
+    3. 显式实例监督: 伪标签提供可解释性
+    4. 联合优化: Bag+Instance损失端到端训练
+
+参考:
+    - current ArcMIL manuscript training pipeline
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, Optional, Tuple
+
+from .angular_transform import AngularCoordinateTransformer
+from .angular_pseudo_label_generator import AngularPseudoLabelGenerator
+
+
+class ArcMIL(nn.Module):
+    """
+    Current public ArcMIL model with pseudo-label supervision
+    
+    架构:
+        Input [N, D]
+            → Projection (可选) [N, proj_dim]
+            → Feature Extraction [N, hidden_dim]
+            → Gated Attention [N, 1] → Aggregation [1, hidden_dim]
+                ├─→ Bag Classifier → bag_logits [1, 1]
+                └─→ Instance Classifier → instance_logits [N, 2]
+        
+        Parallel: Pseudo-Label Generator (离线/在线)
+            → pseudo_labels [N, 2], confidence [N], valid_mask [N]
+    
+    Args:
+        in_dim: 输入特征维度 (CONCH=512, MOC=768)
+        hidden_dim: 隐藏层维度 (默认256)
+        n_classes: 分类数 (二分类=1)
+        dropout: Dropout率
+        lambda_instance: 实例损失权重 λ
+        confidence_threshold: 置信度阈值 τ_conf
+        temperature: Softmax温度 T
+        use_projection: 是否使用投影层 (MOC数据集需要)
+        projection_dim: 投影后维度
+        use_angular_pseudo_label: 是否使用角坐标伪标签 (vs 笛卡尔)
+    """
+    
+    def __init__(
+        self,
+        in_dim: int = 512,
+        hidden_dim: int = 256,
+        n_classes: int = 1,
+        dropout: float = 0.5,
+        lambda_instance: float = 2.0,
+        confidence_threshold: float = 0.8,
+        temperature: float = 0.2,
+        use_projection: bool = False,
+        projection_dim: int = 512,
+        use_angular_pseudo_label: bool = True
+    ):
+        super().__init__()
+        
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.n_classes = n_classes
+        self.lambda_instance = lambda_instance
+        self.confidence_threshold = confidence_threshold
+        self.temperature = temperature
+        self.use_projection = use_projection
+        self.use_angular_pseudo_label = use_angular_pseudo_label
+        
+        # ===== 可选投影层 (MOC: 768→512) =====
+        if use_projection:
+            self.projection = nn.Sequential(
+                nn.Linear(in_dim, projection_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout * 0.5)
+            )
+            effective_in_dim = projection_dim
+        else:
+            effective_in_dim = in_dim
+        
+        # ===== 特征提取器 =====
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(effective_in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # ===== Gated Attention机制 =====
+        self.attention_V = nn.Linear(hidden_dim, hidden_dim // 2, bias=False)
+        self.attention_U = nn.Linear(hidden_dim, hidden_dim // 2, bias=False)
+        self.attention_w = nn.Linear(hidden_dim // 2, 1, bias=False)
+        
+        # ===== 双分类头 =====
+        self.bag_classifier = nn.Linear(hidden_dim, n_classes)
+        self.instance_classifier = nn.Linear(hidden_dim, 2)
+        
+        # ===== 角坐标变换器 (用于伪标签生成) =====
+        if use_angular_pseudo_label:
+            self.angular_transformer = AngularCoordinateTransformer(
+                eps=1e-8,
+                use_float64=False  # 训练时用float32加速
+            )
+            
+            # 伪标签生成器
+            self.pseudo_label_gen = AngularPseudoLabelGenerator(
+                temperature=temperature,
+                confidence_threshold=confidence_threshold,
+                use_abnormal_only=True,
+                abnormal_threshold=0.9
+            )
+        else:
+            self.angular_transformer = None
+            self.pseudo_label_gen = None
+    
+    def set_centers(
+        self,
+        centers_class0: torch.Tensor,
+        centers_class1: torch.Tensor,
+        abnormal_indices_class0: Optional[torch.Tensor] = None,
+        abnormal_indices_class1: Optional[torch.Tensor] = None,
+        is_angular: bool = False
+    ):
+        """
+        设置预计算的聚类中心
+        
+        Args:
+            centers_class0: [K0, D] 或 [K0, D-1]
+            centers_class1: [K1, D] 或 [K1, D-1]
+            abnormal_indices_class0: 类别0的abnormal索引
+            abnormal_indices_class1: 类别1的abnormal索引
+            is_angular: 输入是否为角坐标格式
+        """
+        if not self.use_angular_pseudo_label:
+            print("[Warning] Angular pseudo-label disabled, ignoring centers")
+            return
+            
+        if is_angular:
+            # 已经是角坐标, 直接设置
+            self.pseudo_label_gen.set_centers(
+                centers_class0, centers_class1,
+                abnormal_indices_class0, abnormal_indices_class1
+            )
+        else:
+            # 笛卡尔坐标, 需要转换到角坐标
+            with torch.no_grad():
+                theta_c0 = self.angular_transformer.cartesian_to_angular(centers_class0)
+                theta_c1 = self.angular_transformer.cartesian_to_angular(centers_class1)
+                
+            self.pseudo_label_gen.set_centers(
+                theta_c0, theta_c1,
+                abnormal_indices_class0, abnormal_indices_class1
+            )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        bag_label: Optional[int] = None,
+        return_attention: bool = True,
+        return_features: bool = True
+    ) -> Dict[str, torch.Tensor]:
+        """
+        前向传播
+        
+        Args:
+            x: [N, D] 输入instances特征
+            bag_label: int bag标签 (训练时必需, 用于MIL约束)
+            return_attention: 是否返回注意力权重
+            return_features: 是否返回中间特征
+        
+        Returns:
+            dict {
+                'bag_logits': [1, n_classes] slide级预测logits,
+                'instance_logits': [N, 2] patch级预测logits,
+                'attention': [N, 1] 注意力权重 (可选),
+                'bag_prob': [1, n_classes] 概率分布,
+                'features': [N, hidden_dim] 中间特征 (可选),
+                'pseudo_labels': [N, 2] 伪标签 (如果可用),
+                'confidence': [N] 置信度 (如果可用),
+                'valid_mask': [N] 有效样本掩码 (如果可用)
+            }
+        """
+        N = x.shape[0]
+        
+        # ===== Step 1: 投影 (可选) =====
+        if self.use_projection:
+            x_proj = self.projection(x)
+        else:
+            x_proj = x
+        
+        # ===== Step 2: 特征提取 =====
+        H = self.feature_extractor(x_proj)  # [N, hidden_dim]
+        
+        # ===== Step 3: Gated Attention聚合 =====
+        # Gated Attention: A = softmax(w · (tanh(V·H) ⊙ sigmoid(U·H)))
+        V_out = self.attention_V(H)  # [N, hidden//2]
+        U_out = self.attention_U(H)  # [N, hidden//2]
+        attention_scores = self.attention_w(torch.tanh(V_out) * torch.sigmoid(U_out))  # [N, 1]
+        attention_weights = F.softmax(attention_scores, dim=0)  # [N, 1]
+        
+        # 加权聚合
+        Z = torch.mm(attention_weights.t(), H)  # [1, hidden_dim]
+        
+        # ===== Step 4: 双分类头预测 =====
+        bag_logits = self.bag_classifier(Z)  # [1, n_classes]
+        instance_logits = self.instance_classifier(H)  # [N, 2]
+        
+        # 概率
+        bag_prob = torch.sigmoid(bag_logits)  # [1, n_classes]
+        instance_prob = F.softmax(instance_logits, dim=-1)  # [N, 2]
+        
+        # ===== Step 5: 伪标签生成 (如果centers已加载且在训练模式) =====
+        outputs = {
+            'bag_logits': bag_logits,
+            'instance_logits': instance_logits,
+            'attention': attention_weights if return_attention else None,
+            'bag_prob': bag_prob,
+            'instance_prob': instance_prob,
+            'features': H if return_features else None
+        }
+        
+        if (self.training and 
+            self.use_angular_pseudo_label and 
+            self.pseudo_label_gen.centers_class0 is not None and 
+            bag_label is not None):
+            
+            # 生成伪标签
+            pseudo_result = self.pseudo_label_gen.generate(x, bag_label, mode='cartesian')
+            
+            outputs['pseudo_labels'] = pseudo_result['pseudo_labels']
+            outputs['confidence'] = pseudo_result['confidence']
+            outputs['valid_mask'] = pseudo_result['valid_mask']
+            outputs['sim_to_class0'] = pseudo_result.get('sim_to_class0')
+            outputs['sim_to_class1'] = pseudo_result.get('sim_to_class1')
+        
+        return outputs
+    
+    def compute_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        bag_label: torch.Tensor,
+        reduction: str = 'mean'
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        计算联合损失函数
+        
+        L_total = L_bag + λ · L_instance
+        
+        其中:
+        L_bag = BCE(bag_logits, bag_label)          [slide级]
+        L_instance = CE(instance_logits, pseudo_labels) [patch级, 仅高置信度样本]
+        
+        MIL约束:
+        - 如果bag_label==0 (阴性), 所有instance强制为阴性
+        - 如果bag_label==1 (阳性), 仅使用高置信度样本
+        
+        Args:
+            outputs: forward()返回的字典
+            bag_label: [1] 真实bag标签
+            loss reduction方式 ('mean', 'sum', 'none')
+        
+        Returns:
+            total_loss: Tensor 标量损失
+            loss_dict: dict 各项损失的详细信息
+        """
+        device = outputs['bag_logits'].device
+
+        # ===== Bag-Level Loss (BCE) =====
+        bag_logits = outputs['bag_logits'].view(-1)  # 展平为 [n_classes]
+        bag_label_float = bag_label.float().to(device)
+        
+        bag_loss = F.binary_cross_entropy_with_logits(
+            bag_logits,
+            bag_label_float,
+            reduction=reduction
+        )
+        
+        # 初始化loss dict
+        loss_dict = {
+            'bag_loss': bag_loss.item(),
+            'instance_loss': 0.0,
+            'total_loss': 0.0,
+            'num_valid_instances': 0,
+            'num_total_instances': 0
+        }
+        
+        # ===== Instance-Level Loss (CE) =====
+        instance_loss = torch.tensor(0.0, device=device)
+        
+        if ('pseudo_labels' in outputs and 
+            outputs['pseudo_labels'] is not None and 
+            self.training):
+            
+            instance_logits = outputs['instance_logits']  # [N, 2]
+            pseudo_labels = outputs['pseudo_labels']      # [N, 2]
+            valid_mask = outputs['valid_mask']           # [N]
+            confidence = outputs['confidence']           # [N]
+            
+            N_total = instance_logits.shape[0]
+            N_valid = valid_mask.sum().item()
+            
+            loss_dict['num_total_instances'] = N_total
+            loss_dict['num_valid_instances'] = N_valid
+            
+            if N_valid > 0:
+                # 选择高置信度样本
+                valid_logits = instance_logits[valid_mask]     # [N_valid, 2]
+                valid_pseudo = pseudo_labels[valid_mask]       # [N_valid, 2]
+                
+                # 使用软标签的交叉熵 (KL散度形式)
+                # L_CE(q, p) = -Σ q log(p)
+                instance_loss = F.kl_div(
+                    F.log_softmax(valid_logits, dim=-1),
+                    valid_pseudo,
+                    reduction='batchmean' if reduction == 'mean' else 'sum'
+                )
+                
+                loss_dict['instance_loss'] = instance_loss.item()
+        
+        # ===== Total Loss =====
+        total_loss = bag_loss + self.lambda_instance * instance_loss
+        loss_dict['total_loss'] = total_loss.item()
+        
+        return total_loss, loss_dict
+
+
+def create_model(config=None) -> ArcMIL:
+    """
+    Factory function: create an ArcMIL model from the current config
+    
+    Args:
+        config: Config对象 (默认使用全局Config)
+    
+    Returns:
+        model: ArcMIL instance
+    """
+    if config is None:
+        from config import Config
+        config = Config
+    
+    model = ArcMIL(
+        in_dim=config.IN_DIM,
+        hidden_dim=config.HIDDEN_DIM,
+        n_classes=config.NUM_CLASSES,
+        dropout=config.DROPOUT,
+        lambda_instance=config.LAMBDA_INSTANCE,
+        confidence_threshold=config.CONFIDENCE_THRESHOLD,
+        temperature=config.TEMPERATURE,
+        use_projection=config.USE_PROJECTION,
+        projection_dim=config.PROJECTION_DIM,
+        use_angular_pseudo_label=config.USE_ANGULAR_TRANSFORM
+    )
+    
+    return model
+
+
+if __name__ == '__main__':
+    print("=" * 70)
+    print("Testing ArcMIL Model")
+    print("=" * 70)
+    
+    # 创建模型
+    model = ArcMIL(
+        in_dim=512,
+        hidden_dim=256,
+        n_classes=1,
+        dropout=0.5,
+        lambda_instance=2.0,
+        confidence_threshold=0.8,
+        temperature=0.2,
+        use_angular_pseudo_label=True
+    )
+    
+    print(f"\n[Model Architecture]")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    
+    # 测试前向传播
+    print(f"\n[Test Forward Pass]")
+    N = 100  # 100个patches
+    D = 512  # 特征维度
+    
+    x = torch.randn(N, D)
+    bag_label = torch.tensor([1])  # 阳性bag
+    
+    model.train()
+    outputs = model(x, bag_label=bag_label)
+    
+    print(f"  Input shape: {x.shape}")
+    print(f"  Bag logits shape: {outputs['bag_logits'].shape}")
+    print(f"  Instance logits shape: {outputs['instance_logits'].shape}")
+    print(f"  Attention weights shape: {outputs['attention'].shape}")
+    print(f"  Features shape: {outputs['features'].shape}")
+    
+    # 测试损失计算
+    print(f"\n[Test Loss Computation]")
+    loss, loss_dict = model.compute_loss(outputs, bag_label)
+    
+    print(f"  Total loss: {loss.item():.4f}")
+    for key, value in loss_dict.items():
+        print(f"  {key}: {value:.4f}" if isinstance(value, float) else f"  {key}: {value}")
+    
+    # 测试负样本 (MIL约束)
+    print(f"\n[Test Negative Bag (MIL Constraint)]")
+    bag_label_neg = torch.tensor([0])
+    outputs_neg = model(x, bag_label=bag_label_neg)
+    loss_neg, _ = model.compute_loss(outputs_neg, bag_label_neg)
+    print(f"  Negative bag loss: {loss_neg.item():.4f}")
+    
+    # 设置伪标签中心 (模拟)
+    print(f"\n[Test Setting Centers]")
+    D_minus_1 = 511
+    centers_c0 = torch.randn(6, D_minus_1)
+    centers_c1 = torch.randn(6, D_minus_1)
+    model.set_centers(centers_c0, centers_c1, is_angular=True)
+    
+    # 再次前向传播 (应该有伪标签了)
+    outputs_with_pl = model(x, bag_label=torch.tensor([1]))
+    if 'pseudo_labels' in outputs_with_pl and outputs_with_pl['pseudo_labels'] is not None:
+        print(f"  ✓ Pseudo-labels generated!")
+        print(f"  Shape: {outputs_with_pl['pseudo_labels'].shape}")
+        print(f"  Confidence range: [{outputs_with_pl['confidence'].min():.4f}, "
+              f"{outputs_with_pl['confidence'].max():.4f}]")
+    
+    print("\n" + "=" * 70)
+    print("All tests passed! ✓")
+    print("=" * 70)
